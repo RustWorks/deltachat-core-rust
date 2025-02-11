@@ -2563,9 +2563,6 @@ pub(crate) async fn resume_securejoin_wait(context: &Context) -> Result<()> {
     let Some(bobstate) = BobState::from_db(&context.sql).await? else {
         return Ok(());
     };
-    if !bobstate.in_progress() {
-        return Ok(());
-    }
     let chat_id = bobstate.alice_chat();
     let chat = Chat::load_from_db(context, chat_id).await?;
     let timeout = chat

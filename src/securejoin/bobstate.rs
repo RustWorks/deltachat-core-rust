@@ -194,12 +194,16 @@ impl BobState {
                 )
                 .await?;
             }
-            SecureJoinStep::Terminated | SecureJoinStep::Completed => {
-                sql.execute("DELETE FROM bobstate WHERE id=?;", (self.id,))
-                    .await?;
-            }
         }
         self.next = next;
+        Ok(())
+    }
+
+    /// Deletes this [`BobState`] from the database
+    /// because the joining process has finished.
+    async fn terminate(&self, sql: &Sql) -> Result<()> {
+        sql.execute("DELETE FROM bobstate WHERE id=?", (self.id,))
+            .await?;
         Ok(())
     }
 
@@ -225,7 +229,7 @@ impl BobState {
                 return Ok(None);
             }
         };
-        if !self.is_msg_expected(context, step) {
+        if !self.is_msg_expected(step) {
             info!(context, "{} message out of sync for BobState", step);
             return Ok(None);
         }
@@ -235,8 +239,7 @@ impl BobState {
             "Bob Step 4 - handling {{vc,vg}}-auth-required message."
         );
         if !encrypted_and_signed(context, mime_message, self.invite.fingerprint()) {
-            self.update_next(&context.sql, SecureJoinStep::Terminated)
-                .await?;
+            self.terminate(&context.sql).await?;
             return Ok(Some(BobHandshakeStage::Terminated));
         }
         if !verify_sender_by_fingerprint(
@@ -246,8 +249,7 @@ impl BobState {
         )
         .await?
         {
-            self.update_next(&context.sql, SecureJoinStep::Terminated)
-                .await?;
+            self.terminate(&context.sql).await?;
             return Ok(Some(BobHandshakeStage::Terminated));
         }
         info!(context, "Fingerprint verified.",);
@@ -260,12 +262,12 @@ impl BobState {
     }
 
     /// Returns `true` if the message is expected according to the protocol.
-    pub(crate) fn is_msg_expected(&self, context: &Context, step: &str) -> bool {
+    pub(crate) fn is_msg_expected(&self, step: &str) -> bool {
         let variant_matches = match self.invite {
             QrInvite::Contact { .. } => step.starts_with("vc-"),
             QrInvite::Group { .. } => step.starts_with("vg-"),
         };
-        let step_matches = self.next.matches(context, step);
+        let step_matches = self.next.matches(step);
         variant_matches && step_matches
     }
 
@@ -293,8 +295,7 @@ impl BobState {
         .await?;
         context.emit_event(EventType::ContactsChanged(None));
 
-        self.update_next(&context.sql, SecureJoinStep::Completed)
-            .await?;
+        self.terminate(&context.sql).await?;
         Ok(())
     }
 
@@ -303,15 +304,6 @@ impl BobState {
     /// This takes care of adding the required headers for the step.
     async fn send_handshake_message(&self, context: &Context, step: BobHandshakeMsg) -> Result<()> {
         send_handshake_message(context, &self.invite, self.chat_id, step).await
-    }
-
-    /// Returns whether we are waiting for a SecureJoin message from Alice, i.e. the protocol hasn't
-    /// yet completed.
-    pub(crate) fn in_progress(&self) -> bool {
-        !matches!(
-            self.next,
-            SecureJoinStep::Terminated | SecureJoinStep::Completed
-        )
     }
 }
 
@@ -418,33 +410,14 @@ pub enum SecureJoinStep {
     /// This corresponds to the `vc-contact-confirm` or `vg-member-added` message of step
     /// 6b.
     ContactConfirm,
-    /// The protocol terminated because of an error.
-    ///
-    /// The securejoin protocol terminated, this exists to ensure [`BobState`] can detect
-    /// when it earlier signalled that is should be terminated.  It is an error to call with
-    /// this state.
-    Terminated,
-    /// The protocol completed.
-    ///
-    /// This exists to ensure [`BobState`] can detect when it earlier signalled that it is
-    /// complete.  It is an error to call with this state.
-    Completed,
 }
 
 impl SecureJoinStep {
     /// Compares the legacy string representation of a step to a [`SecureJoinStep`] variant.
-    fn matches(&self, context: &Context, step: &str) -> bool {
+    fn matches(&self, step: &str) -> bool {
         match self {
             Self::AuthRequired => step == "vc-auth-required" || step == "vg-auth-required",
             Self::ContactConfirm => step == "vc-contact-confirm" || step == "vg-member-added",
-            SecureJoinStep::Terminated => {
-                warn!(context, "Terminated state for next securejoin step");
-                false
-            }
-            SecureJoinStep::Completed => {
-                warn!(context, "Completed state for next securejoin step");
-                false
-            }
         }
     }
 }
@@ -454,8 +427,6 @@ impl rusqlite::types::ToSql for SecureJoinStep {
         let num = match &self {
             SecureJoinStep::AuthRequired => 0,
             SecureJoinStep::ContactConfirm => 1,
-            SecureJoinStep::Terminated => 2,
-            SecureJoinStep::Completed => 3,
         };
         let val = rusqlite::types::Value::Integer(num);
         let out = rusqlite::types::ToSqlOutput::Owned(val);
@@ -468,8 +439,6 @@ impl rusqlite::types::FromSql for SecureJoinStep {
         i64::column_result(value).and_then(|val| match val {
             0 => Ok(SecureJoinStep::AuthRequired),
             1 => Ok(SecureJoinStep::ContactConfirm),
-            2 => Ok(SecureJoinStep::Terminated),
-            3 => Ok(SecureJoinStep::Completed),
             _ => Err(rusqlite::types::FromSqlError::OutOfRange(val)),
         })
     }

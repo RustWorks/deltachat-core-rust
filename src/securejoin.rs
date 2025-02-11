@@ -480,7 +480,7 @@ pub(crate) async fn handle_securejoin_handshake(
         =======================================================*/
         "vc-contact-confirm" => {
             if let Some(mut bobstate) = BobState::from_db(&context.sql).await? {
-                if !bobstate.is_msg_expected(context, step) {
+                if !bobstate.is_msg_expected(step) {
                     warn!(context, "Unexpected vc-contact-confirm.");
                     return Ok(HandshakeMessage::Ignore);
                 }
@@ -507,7 +507,7 @@ pub(crate) async fn handle_securejoin_handshake(
                 return Ok(HandshakeMessage::Propagate);
             }
             if let Some(mut bobstate) = BobState::from_db(&context.sql).await? {
-                if !bobstate.is_msg_expected(context, step) {
+                if !bobstate.is_msg_expected(step) {
                     warn!(context, "Unexpected vg-member-added.");
                     return Ok(HandshakeMessage::Propagate);
                 }
