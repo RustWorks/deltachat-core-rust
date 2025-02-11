@@ -8,7 +8,6 @@
 //! protocol.
 
 use anyhow::Result;
-use rusqlite::Connection;
 
 use super::qrinvite::QrInvite;
 use super::{encrypted_and_signed, verify_sender_by_fingerprint};
@@ -81,15 +80,12 @@ impl BobState {
     /// # Bob - the joiner's side
     /// ## Step 2 in the "Setup Contact protocol", section 2.1 of countermitm 0.10.0
     ///
-    /// This currently aborts any other securejoin process if any did not yet complete.  The
-    /// ChatIds of the relevant 1:1 chat of any aborted handshakes are returned so that you
-    /// can report the aboreted handshake in the chat.  (Yes, there can only ever be one
-    /// ChatId in that Vec, the database doesn't care though.)
+    /// This currently aborts any other securejoin process if any did not yet complete.
     pub async fn start_protocol(
         context: &Context,
         invite: QrInvite,
         chat_id: ChatId,
-    ) -> Result<(Self, BobHandshakeStage, Vec<Self>)> {
+    ) -> Result<(Self, BobHandshakeStage)> {
         let peer_verified =
             verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
                 .await?;
@@ -110,8 +106,7 @@ impl BobState {
             next = SecureJoinStep::AuthRequired;
         };
 
-        let (id, aborted_states) =
-            Self::insert_new_db_entry(context, next, invite.clone(), chat_id).await?;
+        let id = Self::insert_new_db_entry(context, next, invite.clone(), chat_id).await?;
         let state = Self {
             id,
             invite,
@@ -124,44 +119,29 @@ impl BobState {
             state.set_peer_verified(context, time()).await?;
         }
 
-        Ok((state, stage, aborted_states))
+        Ok((state, stage))
     }
 
     /// Inserts a new entry in the bobstate table, deleting all previous entries.
     ///
-    /// Returns the ID of the newly inserted entry and all the aborted states.
+    /// Returns the ID of the newly inserted entry.
     async fn insert_new_db_entry(
         context: &Context,
         next: SecureJoinStep,
         invite: QrInvite,
         chat_id: ChatId,
-    ) -> Result<(i64, Vec<Self>)> {
+    ) -> Result<i64> {
         context
             .sql
             .transaction(move |transaction| {
-                // We need to start a write transaction right away, so that we have the
-                // database locked and no one else can write to this table while we read the
-                // rows that we will delete.  So start with a dummy UPDATE.
-                transaction.execute(
-                    r#"UPDATE bobstate SET next_step=?;"#,
-                    (SecureJoinStep::Terminated,),
-                )?;
-                let mut stmt = transaction.prepare("SELECT id FROM bobstate;")?;
-                let mut aborted = Vec::new();
-                for id in stmt.query_map((), |row| row.get::<_, i64>(0))? {
-                    let id = id?;
-                    let state = BobState::from_db_id(transaction, id)?;
-                    aborted.push(state);
-                }
-
-                // Finally delete everything and insert new row.
+                // Delete everything and insert new row.
                 transaction.execute("DELETE FROM bobstate;", ())?;
                 transaction.execute(
                     "INSERT INTO bobstate (invite, next_step, chat_id) VALUES (?, ?, ?);",
                     (invite, next, chat_id),
                 )?;
                 let id = transaction.last_insert_rowid();
-                Ok((id, aborted))
+                Ok(id)
             })
             .await
     }
@@ -184,22 +164,6 @@ impl BobState {
             },
         )
         .await
-    }
-
-    fn from_db_id(connection: &Connection, id: i64) -> rusqlite::Result<Self> {
-        connection.query_row(
-            "SELECT invite, next_step, chat_id FROM bobstate WHERE id=?;",
-            (id,),
-            |row| {
-                let s = BobState {
-                    id,
-                    invite: row.get(0)?,
-                    next: row.get(1)?,
-                    chat_id: row.get(2)?,
-                };
-                Ok(s)
-            },
-        )
     }
 
     /// Returns the [`QrInvite`] used to create this [`BobState`].

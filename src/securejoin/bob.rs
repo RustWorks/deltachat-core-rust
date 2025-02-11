@@ -42,14 +42,8 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
         .await
         .with_context(|| format!("can't create chat for contact {}", invite.contact_id()))?;
 
-    // Now start the protocol and initialise the state
-    let (state, stage, aborted_states) =
-        BobState::start_protocol(context, invite.clone(), chat_id).await?;
-    for state in aborted_states {
-        error!(context, "Aborting previously unfinished QR Join process.");
-        state.notify_aborted(context, "New QR code scanned").await?;
-        state.emit_progress(context, JoinerProgress::Error);
-    }
+    // Now start the protocol and initialise the state.
+    let (state, stage) = BobState::start_protocol(context, invite.clone(), chat_id).await?;
     if matches!(stage, BobHandshakeStage::RequestWithAuthSent) {
         state.emit_progress(context, JoinerProgress::RequestWithAuthSent);
     }
@@ -234,8 +228,6 @@ impl BobState {
 /// This has an `From<JoinerProgress> for usize` impl yielding numbers between 0 and a 1000
 /// which can be shown as a progress bar.
 pub(crate) enum JoinerProgress {
-    /// An error occurred.
-    Error,
     /// vg-vc-request-with-auth sent.
     ///
     /// Typically shows as "alice@addr verified, introducing myself."
@@ -247,7 +239,6 @@ pub(crate) enum JoinerProgress {
 impl From<JoinerProgress> for usize {
     fn from(progress: JoinerProgress) -> Self {
         match progress {
-            JoinerProgress::Error => 0,
             JoinerProgress::RequestWithAuthSent => 400,
             JoinerProgress::Succeeded => 1000,
         }
