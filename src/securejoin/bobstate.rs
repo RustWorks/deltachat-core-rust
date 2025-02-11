@@ -37,7 +37,7 @@ pub enum BobHandshakeStage {
     /// Step 4 completed: (vc|vg)-request-with-auth message sent.
     RequestWithAuthSent,
     /// The protocol prematurely terminated with given reason.
-    Terminated(&'static str),
+    Terminated,
 }
 
 /// The securejoin state kept while Bob is joining.
@@ -271,14 +271,9 @@ impl BobState {
             "Bob Step 4 - handling {{vc,vg}}-auth-required message."
         );
         if !encrypted_and_signed(context, mime_message, self.invite.fingerprint()) {
-            let reason = if mime_message.was_encrypted() {
-                "Valid signature missing"
-            } else {
-                "Required encryption missing"
-            };
             self.update_next(&context.sql, SecureJoinStep::Terminated)
                 .await?;
-            return Ok(Some(BobHandshakeStage::Terminated(reason)));
+            return Ok(Some(BobHandshakeStage::Terminated));
         }
         if !verify_sender_by_fingerprint(
             context,
@@ -289,7 +284,7 @@ impl BobState {
         {
             self.update_next(&context.sql, SecureJoinStep::Terminated)
                 .await?;
-            return Ok(Some(BobHandshakeStage::Terminated("Fingerprint mismatch")));
+            return Ok(Some(BobHandshakeStage::Terminated));
         }
         info!(context, "Fingerprint verified.",);
 

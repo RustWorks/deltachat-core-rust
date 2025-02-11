@@ -115,8 +115,9 @@ pub(super) async fn handle_auth_required(
     };
 
     match bobstate.handle_auth_required(context, message).await? {
-        Some(BobHandshakeStage::Terminated(why)) => {
-            bobstate.notify_aborted(context, why).await?;
+        Some(BobHandshakeStage::Terminated) => {
+            let reason = "Invalid auth-required message";
+            bobstate.notify_aborted(context, reason).await?;
             Ok(HandshakeMessage::Done)
         }
         Some(_stage) => {
