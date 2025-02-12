@@ -29,7 +29,6 @@ mod bob;
 mod bobstate;
 mod qrinvite;
 
-pub(crate) use bobstate::BobState;
 use qrinvite::QrInvite;
 
 use crate::token::Namespace;
@@ -168,8 +167,7 @@ async fn securejoin(context: &Context, qr: &str) -> Result<ChatId> {
     bob::start_protocol(context, invite).await
 }
 
-/// Send handshake message from Alice's device;
-/// Bob's handshake messages are sent in `BobState::send_handshake_message()`.
+/// Send handshake message from Alice's device.
 async fn send_alice_handshake_msg(
     context: &Context,
     contact_id: ContactId,
@@ -259,7 +257,7 @@ pub(crate) enum HandshakeMessage {
     /// This leaves it on the IMAP server.  It means other devices on this account can
     /// receive and potentially process this message as well.  This is useful for example
     /// when the other device is running the protocol and has the relevant QR-code
-    /// information while this device does not have the joiner state ([`BobState`]).
+    /// information while this device does not have the joiner state.
     Ignore,
     /// The message should be further processed by incoming message handling.
     ///
