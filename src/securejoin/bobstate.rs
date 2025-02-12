@@ -30,8 +30,6 @@ pub enum BobHandshakeStage {
     RequestSent,
     /// Step 4 completed: (vc|vg)-request-with-auth message sent.
     RequestWithAuthSent,
-    /// The protocol prematurely terminated with given reason.
-    Terminated,
 }
 
 /// The securejoin state kept while Bob is joining.
@@ -177,22 +175,19 @@ impl BobState {
 
     /// Handles {vc,vg}-auth-required message of the securejoin handshake for Bob.
     ///
-    /// If the message was not used for this handshake `None` is returned, otherwise the new
-    /// stage is returned.  Once [`BobHandshakeStage::Terminated`] is reached this
-    /// [`BobState`] should be destroyed,
-    /// further calling it will just result in the messages being unused by this handshake.
+    /// Returns `true` if the message was used for this handshake, `false` otherwise.
     pub(crate) async fn handle_auth_required(
         &mut self,
         context: &Context,
         mime_message: &MimeMessage,
-    ) -> Result<Option<BobHandshakeStage>> {
+    ) -> Result<bool> {
         info!(
             context,
             "Bob Step 4 - handling {{vc,vg}}-auth-required message."
         );
         if !encrypted_and_signed(context, mime_message, self.invite.fingerprint()) {
             self.terminate(&context.sql).await?;
-            return Ok(Some(BobHandshakeStage::Terminated));
+            return Ok(false);
         }
         if !verify_sender_by_fingerprint(
             context,
@@ -202,14 +197,14 @@ impl BobState {
         .await?
         {
             self.terminate(&context.sql).await?;
-            return Ok(Some(BobHandshakeStage::Terminated));
+            return Ok(false);
         }
         info!(context, "Fingerprint verified.",);
 
         self.terminate(&context.sql).await?;
         self.send_handshake_message(context, BobHandshakeMsg::RequestWithAuth)
             .await?;
-        Ok(Some(BobHandshakeStage::RequestWithAuthSent))
+        Ok(true)
     }
 
     /// Sends the requested handshake message to Alice.

@@ -115,33 +115,27 @@ pub(super) async fn handle_auth_required(
         return Ok(HandshakeMessage::Ignore);
     };
 
-    match bobstate.handle_auth_required(context, message).await? {
-        Some(BobHandshakeStage::Terminated) => {
-            let reason = "Invalid auth-required message";
-            bobstate.notify_aborted(context, reason).await?;
-            Ok(HandshakeMessage::Done)
-        }
-        Some(_stage) => {
-            if bobstate.is_join_group() {
-                // The message reads "Alice replied, waiting to be added to the group…",
-                // so only show it on secure-join and not on setup-contact.
-                let contact_id = bobstate.invite().contact_id();
-                let msg = stock_str::secure_join_replies(context, contact_id).await;
-                let chat_id = bobstate.joining_chat_id(context).await?;
-                chat::add_info_msg(context, chat_id, &msg, time()).await?;
-            }
-            set_peer_verified(
-                context,
-                bobstate.invite().contact_id(),
-                bobstate.alice_chat(),
-                message.timestamp_sent,
-            )
-            .await?;
-            bobstate.emit_progress(context, JoinerProgress::RequestWithAuthSent);
-            Ok(HandshakeMessage::Done)
-        }
-        None => Ok(HandshakeMessage::Ignore),
+    if !bobstate.handle_auth_required(context, message).await? {
+        return Ok(HandshakeMessage::Ignore);
     }
+
+    if bobstate.is_join_group() {
+        // The message reads "Alice replied, waiting to be added to the group…",
+        // so only show it on secure-join and not on setup-contact.
+        let contact_id = bobstate.invite().contact_id();
+        let msg = stock_str::secure_join_replies(context, contact_id).await;
+        let chat_id = bobstate.joining_chat_id(context).await?;
+        chat::add_info_msg(context, chat_id, &msg, time()).await?;
+    }
+    set_peer_verified(
+        context,
+        bobstate.invite().contact_id(),
+        bobstate.alice_chat(),
+        message.timestamp_sent,
+    )
+    .await?;
+    bobstate.emit_progress(context, JoinerProgress::RequestWithAuthSent);
+    Ok(HandshakeMessage::Done)
 }
 
 /// Private implementations for user interactions about this [`BobState`].
@@ -199,24 +193,6 @@ impl BobState {
                 Ok(group_chat_id)
             }
         }
-    }
-
-    /// Notifies the user that the SecureJoin was aborted.
-    ///
-    /// This creates an info message in the chat being joined.
-    async fn notify_aborted(&self, context: &Context, why: &str) -> Result<()> {
-        let contact = Contact::get_by_id(context, self.invite().contact_id()).await?;
-        let mut msg = stock_str::contact_not_verified(context, &contact).await;
-        msg += " (";
-        msg += why;
-        msg += ")";
-        let chat_id = self.joining_chat_id(context).await?;
-        chat::add_info_msg(context, chat_id, &msg, time()).await?;
-        warn!(
-            context,
-            "StockMessage::ContactNotVerified posted to joining chat ({})", why
-        );
-        Ok(())
     }
 }
 
