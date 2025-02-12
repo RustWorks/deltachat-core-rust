@@ -26,7 +26,6 @@ use crate::token;
 use crate::tools::time;
 
 mod bob;
-mod bobstate;
 mod qrinvite;
 
 use qrinvite::QrInvite;

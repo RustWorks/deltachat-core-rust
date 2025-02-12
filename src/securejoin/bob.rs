@@ -1,27 +1,39 @@
-//! Bob's side of SecureJoin handling.
+//! Bob's side of SecureJoin handling, the joiner-side.
 
 use anyhow::{Context as _, Result};
 
 use super::qrinvite::QrInvite;
 use super::HandshakeMessage;
-use crate::chat::{is_contact_in_chat, ChatId, ProtectionStatus};
+use crate::chat::{self, is_contact_in_chat, ChatId, ProtectionStatus};
 use crate::constants::{self, Blocked, Chattype};
 use crate::contact::{Contact, Origin};
 use crate::context::Context;
 use crate::events::EventType;
+use crate::key::{load_self_public_key, DcKey};
+use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
+use crate::param::Param;
 use crate::securejoin::{encrypted_and_signed, verify_sender_by_fingerprint, ContactId};
+use crate::stock_str;
 use crate::sync::Sync::*;
 use crate::tools::{create_smeared_timestamp, time};
-use crate::{chat, stock_str};
 
 /// Starts the securejoin protocol with the QR `invite`.
 ///
-/// This will try to start the securejoin protocol for the given QR `invite`.  If it
-/// succeeded the protocol state will be tracked in `self`.
+/// This will try to start the securejoin protocol for the given QR `invite`.
+///
+/// If Bob already has Alice's key, he sends `AUTH` token
+/// and forgets about the invite.
+/// If Bob does not yet have Alice's key, he sends `vc-request`
+/// or `vg-request` message and stores a row in the `bobstate` table
+/// so he can check Alice's key against the fingerprint
+/// and send `AUTH` token later.
 ///
 /// This function takes care of handling multiple concurrent joins and handling errors while
 /// starting the protocol.
+///
+/// # Bob - the joiner's side
+/// ## Step 2 in the "Setup Contact protocol", section 2.1 of countermitm 0.10.0
 ///
 /// # Returns
 ///
@@ -43,7 +55,37 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
     context.emit_event(EventType::ContactsChanged(None));
 
     // Now start the protocol and initialise the state.
-    crate::securejoin::bobstate::start_protocol(context, invite.clone(), chat_id).await?;
+    {
+        let peer_verified =
+            verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
+                .await?;
+
+        if peer_verified {
+            // The scanned fingerprint matches Alice's key, we can proceed to step 4b.
+            info!(context, "Taking securejoin protocol shortcut");
+            send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth)
+                .await?;
+
+            // Mark 1:1 chat as verified already.
+            crate::securejoin::bob::set_peer_verified(
+                context,
+                invite.contact_id(),
+                chat_id,
+                time(),
+            )
+            .await?;
+
+            context.emit_event(EventType::SecurejoinJoinerProgress {
+                contact_id: invite.contact_id(),
+                progress: JoinerProgress::RequestWithAuthSent.into(),
+            });
+        } else {
+            send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::Request).await?;
+
+            insert_new_db_entry(context, invite.clone(), chat_id).await?;
+        }
+    }
+
     match invite {
         QrInvite::Group { .. } => {
             // For a secure-join we need to create the group and add the contact.  The group will
@@ -92,6 +134,19 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
     }
 }
 
+/// Inserts a new entry in the bobstate table.
+///
+/// Returns the ID of the newly inserted entry.
+async fn insert_new_db_entry(context: &Context, invite: QrInvite, chat_id: ChatId) -> Result<i64> {
+    context
+        .sql
+        .insert(
+            "INSERT INTO bobstate (invite, next_step, chat_id) VALUES (?, ?, ?);",
+            (invite, 0, chat_id),
+        )
+        .await
+}
+
 /// Handles `vc-auth-required` and `vg-auth-required` handshake messages.
 ///
 /// # Bob - the joiner's side
@@ -137,13 +192,7 @@ pub(super) async fn handle_auth_required(
             .sql
             .execute("DELETE FROM bobstate WHERE id=?", (bobstate_row_id,))
             .await?;
-        crate::securejoin::bobstate::send_handshake_message(
-            context,
-            &invite,
-            chat_id,
-            crate::securejoin::bobstate::BobHandshakeMsg::RequestWithAuth,
-        )
-        .await?;
+        send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth).await?;
 
         match invite {
             QrInvite::Contact { .. } => {}
@@ -182,6 +231,94 @@ pub(super) async fn handle_auth_required(
         // Leave the message on IMAP server and let the other device
         // process it.
         Ok(HandshakeMessage::Ignore)
+    }
+}
+
+/// Sends the requested handshake message to Alice.
+pub(crate) async fn send_handshake_message(
+    context: &Context,
+    invite: &QrInvite,
+    chat_id: ChatId,
+    step: BobHandshakeMsg,
+) -> Result<()> {
+    let mut msg = Message {
+        viewtype: Viewtype::Text,
+        text: step.body_text(invite),
+        hidden: true,
+        ..Default::default()
+    };
+    msg.param.set_cmd(SystemMessage::SecurejoinMessage);
+
+    // Sends the step in Secure-Join header.
+    msg.param.set(Param::Arg, step.securejoin_header(invite));
+
+    match step {
+        BobHandshakeMsg::Request => {
+            // Sends the Secure-Join-Invitenumber header in mimefactory.rs.
+            msg.param.set(Param::Arg2, invite.invitenumber());
+            msg.force_plaintext();
+        }
+        BobHandshakeMsg::RequestWithAuth => {
+            // Sends the Secure-Join-Auth header in mimefactory.rs.
+            msg.param.set(Param::Arg2, invite.authcode());
+            msg.param.set_int(Param::GuaranteeE2ee, 1);
+
+            // Sends our own fingerprint in the Secure-Join-Fingerprint header.
+            let bob_fp = load_self_public_key(context).await?.dc_fingerprint();
+            msg.param.set(Param::Arg3, bob_fp.hex());
+
+            // Sends the grpid in the Secure-Join-Group header.
+            //
+            // `Secure-Join-Group` header is deprecated,
+            // but old Delta Chat core requires that Alice receives it.
+            //
+            // Previous Delta Chat core also sent `Secure-Join-Group` header
+            // in `vg-request` messages,
+            // but it was not used on the receiver.
+            if let QrInvite::Group { ref grpid, .. } = invite {
+                msg.param.set(Param::Arg4, grpid);
+            }
+        }
+    };
+
+    chat::send_msg(context, chat_id, &mut msg).await?;
+    Ok(())
+}
+
+/// Identifies the SecureJoin handshake messages Bob can send.
+pub(crate) enum BobHandshakeMsg {
+    /// vc-request or vg-request
+    Request,
+    /// vc-request-with-auth or vg-request-with-auth
+    RequestWithAuth,
+}
+
+impl BobHandshakeMsg {
+    /// Returns the text to send in the body of the handshake message.
+    ///
+    /// This text has no significance to the protocol, but would be visible if users see
+    /// this email message directly, e.g. when accessing their email without using
+    /// DeltaChat.
+    fn body_text(&self, invite: &QrInvite) -> String {
+        format!("Secure-Join: {}", self.securejoin_header(invite))
+    }
+
+    /// Returns the `Secure-Join` header value.
+    ///
+    /// This identifies the step this message is sending information about.  Most protocol
+    /// steps include additional information into other headers, see
+    /// [`send_handshake_message`] for these.
+    fn securejoin_header(&self, invite: &QrInvite) -> &'static str {
+        match self {
+            Self::Request => match invite {
+                QrInvite::Contact { .. } => "vc-request",
+                QrInvite::Group { .. } => "vg-request",
+            },
+            Self::RequestWithAuth => match invite {
+                QrInvite::Contact { .. } => "vc-request-with-auth",
+                QrInvite::Group { .. } => "vg-request-with-auth",
+            },
+        }
     }
 }
 
