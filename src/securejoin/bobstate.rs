@@ -13,24 +13,14 @@ use super::qrinvite::QrInvite;
 use super::{encrypted_and_signed, verify_sender_by_fingerprint};
 use crate::chat::{self, ChatId};
 use crate::context::Context;
+use crate::events::EventType;
 use crate::key::{load_self_public_key, DcKey};
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
+use crate::securejoin::JoinerProgress;
 use crate::sql::Sql;
 use crate::tools::time;
-
-/// The stage of the [`BobState`] securejoin handshake protocol state machine.
-///
-/// This does not concern itself with user interactions, only represents what happened to
-/// the protocol state machine from handling this message.
-#[derive(Clone, Copy, Debug, Display)]
-pub enum BobHandshakeStage {
-    /// Step 2 completed: (vc|vg)-request message sent.
-    RequestSent,
-    /// Step 4 completed: (vc|vg)-request-with-auth message sent.
-    RequestWithAuthSent,
-}
 
 /// The securejoin state kept while Bob is joining.
 ///
@@ -74,7 +64,7 @@ impl BobState {
         context: &Context,
         invite: QrInvite,
         chat_id: ChatId,
-    ) -> Result<(Self, BobHandshakeStage)> {
+    ) -> Result<Self> {
         let peer_verified =
             verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
                 .await?;
@@ -85,8 +75,6 @@ impl BobState {
             send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth)
                 .await?;
 
-            let stage = BobHandshakeStage::RequestWithAuthSent;
-
             // Mark 1:1 chat as verified already.
             crate::securejoin::bob::set_peer_verified(
                 context,
@@ -96,16 +84,19 @@ impl BobState {
             )
             .await?;
 
+            context.emit_event(EventType::SecurejoinJoinerProgress {
+                contact_id: invite.contact_id(),
+                progress: JoinerProgress::RequestWithAuthSent.into(),
+            });
+
             let state = Self {
                 id: 0,
                 invite,
                 chat_id,
             };
-            Ok((state, stage))
+            Ok(state)
         } else {
             send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::Request).await?;
-
-            let stage = BobHandshakeStage::RequestSent;
 
             let id = Self::insert_new_db_entry(context, invite.clone(), chat_id).await?;
             let state = Self {
@@ -113,7 +104,7 @@ impl BobState {
                 invite,
                 chat_id,
             };
-            Ok((state, stage))
+            Ok(state)
         }
     }
 

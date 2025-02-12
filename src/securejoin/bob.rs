@@ -5,7 +5,7 @@
 
 use anyhow::{Context as _, Result};
 
-use super::bobstate::{BobHandshakeStage, BobState};
+use super::bobstate::BobState;
 use super::qrinvite::QrInvite;
 use super::HandshakeMessage;
 use crate::chat::{is_contact_in_chat, ChatId, ProtectionStatus};
@@ -47,13 +47,7 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
     context.emit_event(EventType::ContactsChanged(None));
 
     // Now start the protocol and initialise the state.
-    let (state, stage) = BobState::start_protocol(context, invite.clone(), chat_id).await?;
-    if matches!(stage, BobHandshakeStage::RequestWithAuthSent) {
-        context.emit_event(EventType::SecurejoinJoinerProgress {
-            contact_id: invite.contact_id(),
-            progress: JoinerProgress::RequestWithAuthSent.into(),
-        });
-    }
+    let state = BobState::start_protocol(context, invite.clone(), chat_id).await?;
     match invite {
         QrInvite::Group { .. } => {
             // For a secure-join we need to create the group and add the contact.  The group will
