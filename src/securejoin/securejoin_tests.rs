@@ -893,3 +893,56 @@ async fn test_parallel_securejoin() -> Result<()> {
 
     Ok(())
 }
+
+/// Tests Bob scanning setup contact QR codes of Alice and Fiona
+/// concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_parallel_setup_contact() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let fiona = &tcm.fiona().await;
+
+    // Bob scans Alice's QR code,
+    // but Alice is offline and takes a while to respond.
+    let alice_qr = get_securejoin_qr(alice, None).await?;
+    join_securejoin(bob, &alice_qr).await?;
+    let sent_alice_vc_request = bob.pop_sent_msg().await;
+
+    // Bob scans Fiona's QR code while SecureJoin
+    // process with Alice is not finished.
+    let fiona_qr = get_securejoin_qr(fiona, None).await?;
+    join_securejoin(bob, &fiona_qr).await?;
+    let sent_fiona_vc_request = bob.pop_sent_msg().await;
+
+    fiona.recv_msg_trash(&sent_fiona_vc_request).await;
+    let sent_fiona_vc_auth_required = fiona.pop_sent_msg().await;
+
+    bob.recv_msg_trash(&sent_fiona_vc_auth_required).await;
+    let sent_fiona_vc_request_with_auth = bob.pop_sent_msg().await;
+
+    fiona.recv_msg_trash(&sent_fiona_vc_request_with_auth).await;
+    let sent_fiona_vc_contact_confirm = fiona.pop_sent_msg().await;
+
+    bob.recv_msg_trash(&sent_fiona_vc_contact_confirm).await;
+    let bob_fiona_contact_id = bob.add_or_lookup_contact_id(fiona).await;
+    let bob_fiona_contact = Contact::get_by_id(bob, bob_fiona_contact_id).await.unwrap();
+    assert_eq!(bob_fiona_contact.is_verified(bob).await.unwrap(), true);
+
+    // Alice gets online and previously started SecureJoin process finishes.
+    alice.recv_msg_trash(&sent_alice_vc_request).await;
+    let sent_alice_vc_auth_required = alice.pop_sent_msg().await;
+
+    bob.recv_msg_trash(&sent_alice_vc_auth_required).await;
+    let sent_alice_vc_request_with_auth = bob.pop_sent_msg().await;
+
+    alice.recv_msg_trash(&sent_alice_vc_request_with_auth).await;
+    let sent_alice_vc_contact_confirm = alice.pop_sent_msg().await;
+
+    bob.recv_msg_trash(&sent_alice_vc_contact_confirm).await;
+    let bob_alice_contact_id = bob.add_or_lookup_contact_id(alice).await;
+    let bob_alice_contact = Contact::get_by_id(bob, bob_alice_contact_id).await.unwrap();
+    assert_eq!(bob_alice_contact.is_verified(bob).await.unwrap(), true);
+
+    Ok(())
+}
