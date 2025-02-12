@@ -10,10 +10,11 @@ use super::qrinvite::QrInvite;
 use super::HandshakeMessage;
 use crate::chat::{is_contact_in_chat, ChatId, ProtectionStatus};
 use crate::constants::{self, Blocked, Chattype};
-use crate::contact::Contact;
+use crate::contact::{Contact, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::mimeparser::{MimeMessage, SystemMessage};
+use crate::securejoin::ContactId;
 use crate::sync::Sync::*;
 use crate::tools::{create_smeared_timestamp, time};
 use crate::{chat, stock_str};
@@ -42,10 +43,16 @@ pub(super) async fn start_protocol(context: &Context, invite: QrInvite) -> Resul
         .await
         .with_context(|| format!("can't create chat for contact {}", invite.contact_id()))?;
 
+    ContactId::scaleup_origin(context, &[invite.contact_id()], Origin::SecurejoinJoined).await?;
+    context.emit_event(EventType::ContactsChanged(None));
+
     // Now start the protocol and initialise the state.
     let (state, stage) = BobState::start_protocol(context, invite.clone(), chat_id).await?;
     if matches!(stage, BobHandshakeStage::RequestWithAuthSent) {
-        state.emit_progress(context, JoinerProgress::RequestWithAuthSent);
+        context.emit_event(EventType::SecurejoinJoinerProgress {
+            contact_id: invite.contact_id(),
+            progress: JoinerProgress::RequestWithAuthSent.into(),
+        });
     }
     match invite {
         QrInvite::Group { .. } => {
@@ -123,9 +130,13 @@ pub(super) async fn handle_auth_required(
                 let chat_id = bobstate.joining_chat_id(context).await?;
                 chat::add_info_msg(context, chat_id, &msg, time()).await?;
             }
-            bobstate
-                .set_peer_verified(context, message.timestamp_sent)
-                .await?;
+            set_peer_verified(
+                context,
+                bobstate.invite().contact_id(),
+                bobstate.alice_chat(),
+                message.timestamp_sent,
+            )
+            .await?;
             bobstate.emit_progress(context, JoinerProgress::RequestWithAuthSent);
             Ok(HandshakeMessage::Done)
         }
@@ -207,20 +218,25 @@ impl BobState {
         );
         Ok(())
     }
+}
 
-    /// Turns 1:1 chat with SecureJoin peer into protected chat.
-    pub(crate) async fn set_peer_verified(&self, context: &Context, timestamp: i64) -> Result<()> {
-        let contact = Contact::get_by_id(context, self.invite().contact_id()).await?;
-        self.alice_chat()
-            .set_protection(
-                context,
-                ProtectionStatus::Protected,
-                timestamp,
-                Some(contact.id),
-            )
-            .await?;
-        Ok(())
-    }
+/// Turns 1:1 chat with SecureJoin peer into protected chat.
+pub(crate) async fn set_peer_verified(
+    context: &Context,
+    contact_id: ContactId,
+    chat_id: ChatId,
+    timestamp: i64,
+) -> Result<()> {
+    let contact = Contact::get_by_id(context, contact_id).await?;
+    chat_id
+        .set_protection(
+            context,
+            ProtectionStatus::Protected,
+            timestamp,
+            Some(contact.id),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Progress updates for [`EventType::SecurejoinJoinerProgress`].

@@ -12,16 +12,11 @@ use anyhow::Result;
 use super::qrinvite::QrInvite;
 use super::{encrypted_and_signed, verify_sender_by_fingerprint};
 use crate::chat::{self, ChatId};
-use crate::config::Config;
-use crate::contact::{ContactId, Origin};
 use crate::context::Context;
-use crate::events::EventType;
-use crate::headerdef::HeaderDef;
 use crate::key::{load_self_public_key, DcKey};
 use crate::message::{Message, Viewtype};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::param::Param;
-use crate::securejoin::Peerstate;
 use crate::sql::Sql;
 use crate::tools::time;
 
@@ -44,9 +39,7 @@ pub enum BobHandshakeStage {
 /// This is stored in the database and loaded from there using [`BobState::from_db`].  To
 /// create a new one use [`BobState::start_protocol`].
 ///
-/// This purposefully has nothing optional, the state is always fully valid.  However once a
-/// terminal state is reached in [`BobState::next`] the entry in the database will already
-/// have been deleted.
+/// This purposefully has nothing optional, the state is always fully valid.
 ///
 /// # Conducting the securejoin handshake
 ///
@@ -65,8 +58,6 @@ pub struct BobState {
     id: i64,
     /// The QR Invite code.
     invite: QrInvite,
-    /// The next expected message from Alice.
-    next: SecureJoinStep,
     /// The [`ChatId`] of the 1:1 chat with Alice, matching [`QrInvite::contact_id`].
     chat_id: ChatId,
 }
@@ -90,36 +81,42 @@ impl BobState {
             verify_sender_by_fingerprint(context, invite.fingerprint(), invite.contact_id())
                 .await?;
 
-        let (stage, next);
         if peer_verified {
             // The scanned fingerprint matches Alice's key, we can proceed to step 4b.
             info!(context, "Taking securejoin protocol shortcut");
             send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::RequestWithAuth)
                 .await?;
 
-            stage = BobHandshakeStage::RequestWithAuthSent;
-            next = SecureJoinStep::ContactConfirm;
+            let stage = BobHandshakeStage::RequestWithAuthSent;
+
+            // Mark 1:1 chat as verified already.
+            crate::securejoin::bob::set_peer_verified(
+                context,
+                invite.contact_id(),
+                chat_id,
+                time(),
+            )
+            .await?;
+
+            let state = Self {
+                id: 0,
+                invite,
+                chat_id,
+            };
+            Ok((state, stage))
         } else {
             send_handshake_message(context, &invite, chat_id, BobHandshakeMsg::Request).await?;
 
-            stage = BobHandshakeStage::RequestSent;
-            next = SecureJoinStep::AuthRequired;
-        };
+            let stage = BobHandshakeStage::RequestSent;
 
-        let id = Self::insert_new_db_entry(context, next, invite.clone(), chat_id).await?;
-        let state = Self {
-            id,
-            invite,
-            next,
-            chat_id,
-        };
-
-        if peer_verified {
-            // Mark 1:1 chat as verified already.
-            state.set_peer_verified(context, time()).await?;
+            let id = Self::insert_new_db_entry(context, invite.clone(), chat_id).await?;
+            let state = Self {
+                id,
+                invite,
+                chat_id,
+            };
+            Ok((state, stage))
         }
-
-        Ok((state, stage))
     }
 
     /// Inserts a new entry in the bobstate table, deleting all previous entries.
@@ -127,7 +124,6 @@ impl BobState {
     /// Returns the ID of the newly inserted entry.
     async fn insert_new_db_entry(
         context: &Context,
-        next: SecureJoinStep,
         invite: QrInvite,
         chat_id: ChatId,
     ) -> Result<i64> {
@@ -138,7 +134,7 @@ impl BobState {
                 transaction.execute("DELETE FROM bobstate;", ())?;
                 transaction.execute(
                     "INSERT INTO bobstate (invite, next_step, chat_id) VALUES (?, ?, ?);",
-                    (invite, next, chat_id),
+                    (invite, 0, chat_id),
                 )?;
                 let id = transaction.last_insert_rowid();
                 Ok(id)
@@ -150,19 +146,14 @@ impl BobState {
     pub async fn from_db(sql: &Sql) -> Result<Option<Self>> {
         // Because of how Self::start_protocol() updates the database we are currently
         // guaranteed to only have one row.
-        sql.query_row_optional(
-            "SELECT id, invite, next_step, chat_id FROM bobstate;",
-            (),
-            |row| {
-                let s = BobState {
-                    id: row.get(0)?,
-                    invite: row.get(1)?,
-                    next: row.get(2)?,
-                    chat_id: row.get(3)?,
-                };
-                Ok(s)
-            },
-        )
+        sql.query_row_optional("SELECT id, invite, chat_id FROM bobstate;", (), |row| {
+            let s = BobState {
+                id: row.get(0)?,
+                invite: row.get(1)?,
+                chat_id: row.get(2)?,
+            };
+            Ok(s)
+        })
         .await
     }
 
@@ -174,29 +165,6 @@ impl BobState {
     /// Returns the [`ChatId`] of the 1:1 chat with the inviter (Alice).
     pub fn alice_chat(&self) -> ChatId {
         self.chat_id
-    }
-
-    /// Updates the [`BobState::next`] field in memory and the database.
-    ///
-    /// If the next state is a terminal state it will remove this [`BobState`] from the
-    /// database.
-    ///
-    /// If a user scanned a new QR code after this [`BobState`] was loaded this update will
-    /// fail currently because starting a new joiner process currently kills any previously
-    /// running processes.  This is a limitation which will go away in the future.
-    async fn update_next(&mut self, sql: &Sql, next: SecureJoinStep) -> Result<()> {
-        // TODO: write test verifying how this would fail.
-        match next {
-            SecureJoinStep::AuthRequired | SecureJoinStep::ContactConfirm => {
-                sql.execute(
-                    "UPDATE bobstate SET next_step=? WHERE id=?;",
-                    (next, self.id),
-                )
-                .await?;
-            }
-        }
-        self.next = next;
-        Ok(())
     }
 
     /// Deletes this [`BobState`] from the database
@@ -218,22 +186,6 @@ impl BobState {
         context: &Context,
         mime_message: &MimeMessage,
     ) -> Result<Option<BobHandshakeStage>> {
-        let step = match mime_message.get_header(HeaderDef::SecureJoin) {
-            Some(step) => step,
-            None => {
-                warn!(
-                    context,
-                    "Message has no Secure-Join header: {}",
-                    mime_message.get_rfc724_mid().unwrap_or_default()
-                );
-                return Ok(None);
-            }
-        };
-        if !self.is_msg_expected(step) {
-            info!(context, "{} message out of sync for BobState", step);
-            return Ok(None);
-        }
-
         info!(
             context,
             "Bob Step 4 - handling {{vc,vg}}-auth-required message."
@@ -254,49 +206,10 @@ impl BobState {
         }
         info!(context, "Fingerprint verified.",);
 
-        self.update_next(&context.sql, SecureJoinStep::ContactConfirm)
-            .await?;
+        self.terminate(&context.sql).await?;
         self.send_handshake_message(context, BobHandshakeMsg::RequestWithAuth)
             .await?;
         Ok(Some(BobHandshakeStage::RequestWithAuthSent))
-    }
-
-    /// Returns `true` if the message is expected according to the protocol.
-    pub(crate) fn is_msg_expected(&self, step: &str) -> bool {
-        let variant_matches = match self.invite {
-            QrInvite::Contact { .. } => step.starts_with("vc-"),
-            QrInvite::Group { .. } => step.starts_with("vg-"),
-        };
-        let step_matches = self.next.matches(step);
-        variant_matches && step_matches
-    }
-
-    /// Handles a *vc-contact-confirm* or *vg-member-added* message.
-    ///
-    /// # Bob - the joiner's side
-    /// ## Step 7 in the "Setup Contact protocol", section 2.1 of countermitm 0.10.0
-    pub(crate) async fn step_contact_confirm(&mut self, context: &Context) -> Result<()> {
-        let fingerprint = self.invite.fingerprint();
-        let Some(ref mut peerstate) = Peerstate::from_fingerprint(context, fingerprint).await?
-        else {
-            return Ok(());
-        };
-
-        // Mark peer as backward verified.
-        peerstate.backward_verified_key_id =
-            Some(context.get_config_i64(Config::KeyId).await?).filter(|&id| id > 0);
-        peerstate.save_to_db(&context.sql).await?;
-
-        ContactId::scaleup_origin(
-            context,
-            &[self.invite.contact_id()],
-            Origin::SecurejoinJoined,
-        )
-        .await?;
-        context.emit_event(EventType::ContactsChanged(None));
-
-        self.terminate(&context.sql).await?;
-        Ok(())
     }
 
     /// Sends the requested handshake message to Alice.
@@ -395,51 +308,5 @@ impl BobHandshakeMsg {
                 QrInvite::Group { .. } => "vg-request-with-auth",
             },
         }
-    }
-}
-
-/// The next message expected by [`BobState`] in the setup-contact/secure-join protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecureJoinStep {
-    /// Expecting the auth-required message.
-    ///
-    /// This corresponds to the `vc-auth-required` or `vg-auth-required` message of step 3d.
-    AuthRequired,
-    /// Expecting the contact-confirm message.
-    ///
-    /// This corresponds to the `vc-contact-confirm` or `vg-member-added` message of step
-    /// 6b.
-    ContactConfirm,
-}
-
-impl SecureJoinStep {
-    /// Compares the legacy string representation of a step to a [`SecureJoinStep`] variant.
-    fn matches(&self, step: &str) -> bool {
-        match self {
-            Self::AuthRequired => step == "vc-auth-required" || step == "vg-auth-required",
-            Self::ContactConfirm => step == "vc-contact-confirm" || step == "vg-member-added",
-        }
-    }
-}
-
-impl rusqlite::types::ToSql for SecureJoinStep {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        let num = match &self {
-            SecureJoinStep::AuthRequired => 0,
-            SecureJoinStep::ContactConfirm => 1,
-        };
-        let val = rusqlite::types::Value::Integer(num);
-        let out = rusqlite::types::ToSqlOutput::Owned(val);
-        Ok(out)
-    }
-}
-
-impl rusqlite::types::FromSql for SecureJoinStep {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        i64::column_result(value).and_then(|val| match val {
-            0 => Ok(SecureJoinStep::AuthRequired),
-            1 => Ok(SecureJoinStep::ContactConfirm),
-            _ => Err(rusqlite::types::FromSqlError::OutOfRange(val)),
-        })
     }
 }

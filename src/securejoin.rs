@@ -479,15 +479,10 @@ pub(crate) async fn handle_securejoin_handshake(
         ====   Step 7 in "Setup verified contact" protocol   ====
         =======================================================*/
         "vc-contact-confirm" => {
-            if let Some(mut bobstate) = BobState::from_db(&context.sql).await? {
-                if !bobstate.is_msg_expected(step) {
-                    warn!(context, "Unexpected vc-contact-confirm.");
-                    return Ok(HandshakeMessage::Ignore);
-                }
-
-                bobstate.step_contact_confirm(context).await?;
-                bobstate.emit_progress(context, JoinerProgress::Succeeded);
-            }
+            context.emit_event(EventType::SecurejoinJoinerProgress {
+                contact_id,
+                progress: JoinerProgress::Succeeded.into(),
+            });
             Ok(HandshakeMessage::Ignore)
         }
         "vg-member-added" => {
@@ -506,15 +501,10 @@ pub(crate) async fn handle_securejoin_handshake(
                 );
                 return Ok(HandshakeMessage::Propagate);
             }
-            if let Some(mut bobstate) = BobState::from_db(&context.sql).await? {
-                if !bobstate.is_msg_expected(step) {
-                    warn!(context, "Unexpected vg-member-added.");
-                    return Ok(HandshakeMessage::Propagate);
-                }
-
-                bobstate.step_contact_confirm(context).await?;
-                bobstate.emit_progress(context, JoinerProgress::Succeeded);
-            }
+            context.emit_event(EventType::SecurejoinJoinerProgress {
+                contact_id,
+                progress: JoinerProgress::Succeeded.into(),
+            });
             Ok(HandshakeMessage::Propagate)
         }
 
