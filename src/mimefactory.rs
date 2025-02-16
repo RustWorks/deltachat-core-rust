@@ -1840,6 +1840,22 @@ mod tests {
         );
     }
 
+    fn render_header_text(text: &str) -> String {
+        let mut output = Vec::<u8>::new();
+        mail_builder::headers::text::Text::new(text.to_string())
+            .write_header(&mut output, 0)
+            .unwrap();
+
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn test_header_encoding() {
+        assert_eq!(render_header_text("foobar"), "foobar\r\n");
+        assert_eq!(render_header_text("-_.~%"), "-_.~%\r\n");
+        assert_eq!(render_header_text("äöü"), "=?utf-8?B?w6TDtsO8?=\r\n");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_manually_set_subject() -> Result<()> {
         let t = TestContext::new_alice().await;
