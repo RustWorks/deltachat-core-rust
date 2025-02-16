@@ -1747,6 +1747,7 @@ fn encode_words(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use deltachat_contact_tools::ContactAddress;
+    use mail_builder::headers::Header;
     use mailparse::{addrparse_header, MailHeaderMap};
     use std::str;
 
@@ -1762,6 +1763,56 @@ mod tests {
     use crate::mimeparser::MimeMessage;
     use crate::receive_imf::receive_imf;
     use crate::test_utils::{get_chat_msg, TestContext, TestContextManager};
+
+    fn render_email_address(display_name: &str, addr: &str) -> String {
+        let mut output = Vec::<u8>::new();
+        new_address_with_name(display_name, addr.to_string())
+            .unwrap_address()
+            .write_header(&mut output, 0)
+            .unwrap();
+
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn test_render_email_address() {
+        let display_name = "ä space";
+        let addr = "x@y.org";
+
+        assert!(!display_name.is_ascii());
+        assert!(!display_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' '));
+
+        let s = render_email_address(display_name, addr);
+
+        println!("{s}");
+
+        assert_eq!(s, r#""=?utf-8?B?w6Qgc3BhY2U=?=" <x@y.org>"#);
+    }
+
+    #[test]
+    fn test_render_email_address_noescape() {
+        let display_name = "a space";
+        let addr = "x@y.org";
+
+        assert!(display_name.is_ascii());
+        assert!(display_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' '));
+
+        let s = render_email_address(display_name, addr);
+
+        // Addresses should not be unnecessarily be encoded, see <https://github.com/deltachat/deltachat-core-rust/issues/1575>:
+        assert_eq!(s, r#""a space" <x@y.org>"#);
+    }
+
+    #[test]
+    fn test_render_email_address_duplicated_as_name() {
+        let addr = "x@y.org";
+        let s = render_email_address(addr, addr);
+        assert_eq!(s, "<x@y.org>");
+    }
 
     #[test]
     fn test_render_rfc724_mid() {
